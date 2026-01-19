@@ -620,6 +620,100 @@ server.registerTool(
     },
 )
 
+// Tool: export_svg
+server.registerTool(
+    "export_svg",
+    {
+        description:
+            "Export the current diagram to an SVG file.\n\n" +
+            "The SVG is obtained from the browser's cached preview. " +
+            "If the cache is not available or you need the latest version, " +
+            "ensure the browser has saved the diagram recently.",
+        inputSchema: {
+            path: z
+                .string()
+                .describe("File path to save the SVG (e.g., ./diagram.svg)"),
+        },
+    },
+    async ({ path }) => {
+        try {
+            if (!currentSession) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: "Error: No active session. Please call start_session first.",
+                        },
+                    ],
+                    isError: true,
+                }
+            }
+
+            // Fetch latest state from browser
+            const browserState = getState(currentSession.id)
+            if (browserState?.xml) {
+                currentSession.xml = browserState.xml
+            }
+
+            // Check if SVG is available in cache
+            const svgData = browserState?.svg
+            if (!svgData) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text:
+                                "Error: No SVG cached. Please ensure:\n" +
+                                "1. The browser window is open and connected\n" +
+                                "2. You have made changes in the browser (triggers SVG generation)\n" +
+                                "3. Wait a moment for the browser to save the SVG",
+                        },
+                    ],
+                    isError: true,
+                }
+            }
+
+            const fs = await import("node:fs/promises")
+            const nodePath = await import("node:path")
+
+            let filePath = path
+            if (!filePath.endsWith(".svg")) {
+                filePath = `${filePath}.svg`
+            }
+
+            const absolutePath = nodePath.resolve(filePath)
+
+            // Handle data URI format (data:image/svg+xml;base64,...)
+            let svgContent = svgData
+            if (svgData.startsWith("data:image/svg+xml")) {
+                const base64Data = svgData.split(",")[1]
+                svgContent = Buffer.from(base64Data, "base64").toString("utf-8")
+            }
+
+            await fs.writeFile(absolutePath, svgContent, "utf-8")
+
+            log.info(`Diagram exported to SVG: ${absolutePath}`)
+
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Diagram exported successfully!\n\nFile: ${absolutePath}\nSize: ${svgContent.length} bytes`,
+                    },
+                ],
+            }
+        } catch (error) {
+            const message =
+                error instanceof Error ? error.message : String(error)
+            log.error("export_svg failed:", message)
+            return {
+                content: [{ type: "text", text: `Error: ${message}` }],
+                isError: true,
+            }
+        }
+    },
+)
+
 // Graceful shutdown handler
 let isShuttingDown = false
 function gracefulShutdown(reason: string) {

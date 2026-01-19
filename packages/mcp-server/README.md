@@ -119,6 +119,7 @@ Use the standard MCP configuration with:
 | `edit_diagram` | Edit diagram by ID-based operations (update/add/delete cells) |
 | `get_diagram` | Get the current diagram XML |
 | `export_diagram` | Save diagram to a `.drawio` file |
+| `export_svg` | Export diagram to an `.svg` file |
 
 ## How It Works
 
