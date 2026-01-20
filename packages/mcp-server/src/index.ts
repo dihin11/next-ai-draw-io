@@ -76,17 +76,12 @@ server.prompt(
                 role: "user",
                 content: {
                     type: "text",
-                    text: `# Draw.io Diagram Workflow Guidelines
+                    text: `# Draw.io Diagram Creation Guidelines
 
-## Creating Diagrams
+## Workflow
 1. Call start_session to create a new session (returns session_id)
 2. Use create_diagram with session_id to create diagrams (returns diagram_id)
 3. Each session can contain multiple diagrams
-
-## Editing Diagrams
-1. Use get_diagram to fetch current diagram XML
-2. Use edit_diagram with operations to modify specific cells
-3. Operations: add, update, delete
 
 ## Exporting Diagrams
 1. Use export_diagram with format option:
@@ -97,10 +92,48 @@ server.prompt(
    - "content": Returns SVG/XML string directly
    - "url": Saves file and returns URL
 
-## Important Notes
-- Always use unique cell_ids when adding elements
-- Keep elements within reasonable bounds (x=0-800, y=0-600)
-- Use unique IDs starting from "2" (0 and 1 are reserved)`,
+## Draw.io XML Schema Reference
+
+### Basic Structure
+\`\`\`xml
+<mxGraphModel>
+  <root>
+    <mxCell id="0" />  <!-- Root cell, always present -->
+    <mxCell id="1" />  <!-- Default parent for all elements -->
+    <!-- Your diagram elements go here -->
+  </root>
+</mxGraphModel>
+\`\`\`
+
+### Vertex (Shape/Box)
+\`\`\`xml
+<mxCell id="2" parent="1" vertex="1" value="Box Label"
+  style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;">
+  <mxGeometry x="100" y="100" width="120" height="60" as="geometry"/>
+</mxCell>
+\`\`\`
+
+### Edge (Line/Arrow)
+\`\`\`xml
+<mxCell id="3" parent="1" edge="1" source="2" target="4"
+  style="edgeStyle=orthogonalEdgeStyle;rounded=0;strokeWidth=2;">
+  <mxGeometry relative="1" as="geometry"/>
+</mxCell>
+\`\`\`
+
+### Common Style Examples
+- **Rectangle**: \`rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;\`
+- **Rounded Box**: \`rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;\`
+- **Diamond (Decision)**: \`shape=mxgraph.flowchart.decision;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;\`
+- **Cylinder (Database)**: \`shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;\`
+- **Document**: \`shape=mxgraph.basic.document;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;\`
+
+### Important Rules
+- **IDs**: Start from "2", "0" and "1" are reserved
+- **Coordinates**: Keep within reasonable bounds (x=0-2000, y=0-1500)
+- **Connect edges**: source and target must point to valid vertex IDs
+- **Positioning**: Plan layout manually, draw.io won't auto-arrange
+- **Unique IDs**: Every cell must have a unique ID`,
                 },
             },
         ],

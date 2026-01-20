@@ -10,7 +10,8 @@
         "DRAWIO_BASE_URL": "https://embed.diagrams.net",
         "EXPORTS_DIR": "/tmp/mcp-drawio-exports",
         "SESSION_TIMEOUT": "3600000"
-      }
+      },
+      "disabled": true
     }
   }
 }
