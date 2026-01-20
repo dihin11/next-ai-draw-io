@@ -1,207 +1,199 @@
 # Next AI Draw.io MCP Server
 
-MCP (Model Context Protocol) server that enables AI agents like Claude Desktop and Cursor to generate and edit draw.io diagrams with **real-time browser preview**.
+MCP (Model Context Protocol) server that enables AI agents to generate and edit draw.io diagrams with **SVG export support**.
 
-**Self-contained** - includes an embedded HTTP server, no external dependencies required.
+**Features:**
+- Multiple diagrams per session
+- SVG/drawio.svg/drawio export formats
+- Streamable HTTP transport for server deployment
+- Puppeteer-based SVG rendering
 
-## Quick Start
+## Quick Start (HTTP Server Mode)
 
-```json
-{
-  "mcpServers": {
-    "drawio": {
-      "command": "npx",
-      "args": ["@next-ai-drawio/mcp-server@latest"]
-    }
-  }
-}
+```bash
+# Install and run
+npx @next-ai-drawio/mcp-server@latest
+
+# Server starts at http://localhost:6002
+# MCP endpoint: http://localhost:6002/mcp
 ```
 
 ## Installation
 
-### Claude Desktop
-
-Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
-
-```json
-{
-  "mcpServers": {
-    "drawio": {
-      "command": "npx",
-      "args": ["@next-ai-drawio/mcp-server@latest"]
-    }
-  }
-}
-```
-
-### VS Code
-
-Add to your VS Code settings (`.vscode/mcp.json` in workspace or user settings):
-
-```json
-{
-  "mcpServers": {
-    "drawio": {
-      "command": "npx",
-      "args": ["@next-ai-drawio/mcp-server@latest"]
-    }
-  }
-}
-```
-
-### Cursor
-
-Add to Cursor MCP config (`~/.cursor/mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "drawio": {
-      "command": "npx",
-      "args": ["@next-ai-drawio/mcp-server@latest"]
-    }
-  }
-}
-```
-
-### Cline (VS Code Extension)
-
-1. Click the **MCP Servers** icon in Cline's top menu bar
-2. Select the **Configure** tab
-3. Click **Configure MCP Servers** to edit `cline_mcp_settings.json`
-4. Add the drawio server:
-
-```json
-{
-  "mcpServers": {
-    "drawio": {
-      "command": "npx",
-      "args": ["@next-ai-drawio/mcp-server@latest"]
-    }
-  }
-}
-```
-
-### Claude Code CLI
+### Server Deployment (Pod/Container)
 
 ```bash
-claude mcp add drawio -- npx @next-ai-drawio/mcp-server@latest
+npm install @next-ai-drawio/mcp-server
 ```
 
-### Other MCP Clients
-
-Use the standard MCP configuration with:
-- **Command**: `npx`
-- **Args**: `["@next-ai-drawio/mcp-server@latest"]`
-
-## Usage
-
-1. Restart your MCP client after updating config
-2. Ask the AI to create a diagram:
-   > "Create a flowchart showing user authentication with login, MFA, and session management"
-3. The diagram appears in your browser in real-time!
-
-## Features
-
-- **Real-time Preview**: Diagrams appear and update in your browser as the AI creates them
-- **Version History**: Restore previous diagram versions with visual thumbnails - click the clock button (bottom-right) to browse and restore earlier states
-- **Natural Language**: Describe diagrams in plain text - flowcharts, architecture diagrams, etc.
-- **Edit Support**: Modify existing diagrams with natural language instructions
-- **Export**: Save diagrams as `.drawio` files
-- **Self-contained**: Embedded server, works offline (except draw.io UI which loads from `embed.diagrams.net` by default, configurable via `DRAWIO_BASE_URL`)
-
-## Available Tools
-
-| Tool | Description |
-|------|-------------|
-| `start_session` | Opens browser with real-time diagram preview |
-| `create_new_diagram` | Create a new diagram from XML (requires `xml` argument) |
-| `edit_diagram` | Edit diagram by ID-based operations (update/add/delete cells) |
-| `get_diagram` | Get the current diagram XML |
-| `export_diagram` | Save diagram to a `.drawio` file |
-
-## How It Works
-
-```
-┌─────────────────┐     stdio      ┌─────────────────┐
-│  Claude Desktop │ <───────────> │   MCP Server    │
-│    (AI Agent)   │               │  (this package) │
-└─────────────────┘               └────────┬────────┘
-                                          │
-                                 ┌────────▼────────┐
-                                 │ Embedded HTTP   │
-                                 │ Server (:6002)  │
-                                 └────────┬────────┘
-                                          │
-                                 ┌────────▼────────┐
-                                 │  User's Browser │
-                                 │ (draw.io embed) │
-                                 └─────────────────┘
+```javascript
+// Start the server
+import "@next-ai-drawio/mcp-server"
 ```
 
-1. **MCP Server** receives tool calls from Claude via stdio
-2. **Embedded HTTP Server** serves the draw.io UI and handles state
-3. **Browser** shows real-time diagram updates via polling
+Or use npx:
+```bash
+npx @next-ai-drawio/mcp-server
+```
 
-## Configuration
+### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PORT` | `6002` | Port for the embedded HTTP server |
-| `DRAWIO_BASE_URL` | `https://embed.diagrams.net` | Base URL for the draw.io embed. Set this to use a self-hosted draw.io instance for private deployments. |
+| `PORT` | `6002` | HTTP server port |
+| `DRAWIO_BASE_URL` | `https://embed.diagrams.net` | draw.io embed URL for SVG rendering |
+| `EXPORTS_DIR` | `/tmp/mcp-drawio-exports` | Directory for exported files |
 
-### Private Deployment (Self-hosted draw.io)
+## API Endpoints
 
-For security-sensitive environments that require private deployment of draw.io:
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/mcp` | GET/POST | MCP Streamable HTTP transport |
+| `/exports/{session_id}/{filename}` | GET | Serve exported files |
+| `/health` | GET | Health check |
+| `/` | GET | Server info |
 
-```json
-{
-  "mcpServers": {
-    "drawio": {
-      "command": "npx",
-      "args": ["@next-ai-drawio/mcp-server@latest"],
-      "env": { 
-        "DRAWIO_BASE_URL": "https://drawio.your-company.com"
-      }
-    }
-  }
-}
+## MCP Tools
+
+### Session Management
+
+| Tool | Description |
+|------|-------------|
+| `start_session` | Create a new session, returns `session_id` |
+| `end_session` | End a session and cleanup |
+
+### Diagram Operations
+
+| Tool | Description |
+|------|-------------|
+| `create_diagram` | Create a new diagram from mxGraphModel XML |
+| `edit_diagram` | Edit diagram with add/update/delete operations |
+| `get_diagram` | Get current diagram XML |
+| `list_diagrams` | List all diagrams in a session |
+| `delete_diagram` | Delete a diagram |
+
+### Export
+
+| Tool | Description |
+|------|-------------|
+| `export_diagram` | Export diagram to svg/drawio_svg/drawio format |
+
+**Export Options:**
+- `format`: `"svg"` | `"drawio_svg"` | `"drawio"`
+  - `svg`: Standard SVG for display
+  - `drawio_svg`: SVG with embedded diagram data (re-editable)
+  - `drawio`: Original XML format
+- `output`: `"content"` | `"url"`
+  - `content`: Returns file content directly
+  - `url`: Saves file and returns URL
+
+## Usage Example
+
+```typescript
+// 1. Start session
+const session = await mcp.call("start_session")
+// Returns: { session_id: "session-xxx" }
+
+// 2. Create diagram
+const diagram = await mcp.call("create_diagram", {
+  session_id: session.session_id,
+  xml: `<mxGraphModel>
+    <root>
+      <mxCell id="0"/>
+      <mxCell id="1" parent="0"/>
+      <mxCell id="2" value="Hello" style="rounded=1;" vertex="1" parent="1">
+        <mxGeometry x="100" y="100" width="120" height="60" as="geometry"/>
+      </mxCell>
+    </root>
+  </mxGraphModel>`
+})
+// Returns: { diagram_id: "diagram-xxx" }
+
+// 3. Export as SVG
+const exported = await mcp.call("export_diagram", {
+  session_id: session.session_id,
+  diagram_id: diagram.diagram_id,
+  format: "svg",
+  output: "url"
+})
+// Returns: { url: "http://localhost:6002/exports/session-xxx/diagram-xxx.svg" }
+
+// 4. End session
+await mcp.call("end_session", { session_id: session.session_id })
 ```
 
-You can deploy your own draw.io instance using the official Docker image:
+## Architecture
 
-```bash
-docker run -d -p 8080:8080 jgraph/drawio
+```
+┌─────────────────────────────────────────────────────────┐
+│                    MCP HTTP Server                      │
+│                     (Port 6002)                         │
+├─────────────────────────────────────────────────────────┤
+│  /mcp        → Streamable HTTP MCP transport            │
+│  /exports/*  → Static file serving                      │
+│  /health     → Health check                             │
+├─────────────────────────────────────────────────────────┤
+│                  Session Manager                        │
+│   session_1: { diagram_a, diagram_b, ... }              │
+│   session_2: { diagram_x, diagram_y, ... }              │
+├─────────────────────────────────────────────────────────┤
+│                 Puppeteer Browser                       │
+│              (Headless, singleton)                      │
+└─────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+              embed.diagrams.net (SVG rendering)
 ```
 
-Then set `DRAWIO_BASE_URL=http://localhost:8080` (or your server's URL).
+## Docker
+
+```dockerfile
+FROM node:20-slim
+
+# Install Chrome dependencies for Puppeteer
+RUN apt-get update && apt-get install -y \
+    chromium \
+    --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
+WORKDIR /app
+RUN npm install @next-ai-drawio/mcp-server
+
+EXPOSE 6002
+CMD ["npx", "@next-ai-drawio/mcp-server"]
+```
 
 ## Troubleshooting
 
-### Port already in use
+### Puppeteer fails to start
 
-If port 6002 is in use, the server will automatically try the next available port (up to 6020).
+In containerized environments, you may need to install Chrome dependencies:
 
-Or set a custom port:
-```json
-{
-  "mcpServers": {
-    "drawio": {
-      "command": "npx",
-      "args": ["@next-ai-drawio/mcp-server@latest"],
-      "env": { "PORT": "6003" }
-    }
-  }
-}
+```bash
+apt-get install -y chromium
+export PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 ```
 
-### "No active session"
+### Port already in use
 
-Call `start_session` first to open the browser window.
+Set a custom port via environment variable:
 
-### Browser not updating
+```bash
+PORT=6003 npx @next-ai-drawio/mcp-server
+```
 
-Check that the browser URL has the `?mcp=` query parameter. The MCP session ID connects the browser to the server.
+### SVG export timeout
+
+The SVG rendering requires network access to `embed.diagrams.net` (or your private draw.io instance). Ensure the server can reach this URL.
+
+For private deployments:
+
+```bash
+DRAWIO_BASE_URL=https://drawio.your-company.com npx @next-ai-drawio/mcp-server
+```
 
 ## License
 

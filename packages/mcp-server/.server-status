@@ -1,0 +1,54 @@
+# Next AI Draw.io MCP Server - 服务状态
+
+## 当前运行状态
+
+✅ **服务已成功启动**
+
+| 项目 | 值 |
+|------|-----|
+| 进程 ID | 3771548 |
+| 端口 | 6005 |
+| 传输协议 | Streamable HTTP |
+| 健康状态 | OK |
+| 运行时间 | 检查中... |
+
+## 端点地址
+
+| 端点 | URL |
+|------|-----|
+| MCP API | http://localhost:6005/mcp |
+| 健康检查 | http://localhost:6005/health |
+| 服务信息 | http://localhost:6005/ |
+| 导出文件 | http://localhost:6005/exports/{session_id}/{filename} |
+
+## 测试命令
+
+```bash
+# 健康检查
+curl http://localhost:6005/health
+
+# 服务信息
+curl http://localhost:6005/
+
+# 查看日志
+tail -f /tmp/mcp-server-6005.log
+```
+
+## 配置文件位置
+
+- MCP 配置: `.mcp.json`
+- 使用指南: `USAGE.md`
+- 测试脚本: `test-server.sh`
+
+## 停止服务
+
+```bash
+kill 3771548
+```
+
+## 重启服务
+
+```bash
+kill 3771548
+PORT=6005 npm start &
+```

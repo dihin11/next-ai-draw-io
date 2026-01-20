@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * MCP Server for Next AI Draw.io
+ * MCP SSE Server for Next AI Draw.io
  *
- * Enables AI agents (Claude Desktop, Cursor, etc.) to generate and edit
- * draw.io diagrams with real-time browser preview.
+ * Enables AI agents to generate and edit draw.io diagrams with SVG export.
+ * Supports multiple sessions, each containing multiple diagrams.
  *
- * Uses an embedded HTTP server - no external dependencies required.
+ * Transport: HTTP Streamable (MCP specification)
  */
 
 // Setup DOM polyfill for Node.js (required for XML operations)
@@ -26,43 +26,44 @@ class XMLSerializerPolyfill {
 }
 ;(globalThis as any).XMLSerializer = XMLSerializerPolyfill
 
+import http from "node:http"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
-import open from "open"
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js"
 import { z } from "zod"
 import {
     applyDiagramOperations,
     type DiagramOperation,
 } from "./diagram-operations.js"
-import { addHistory } from "./history.js"
-import {
-    getState,
-    requestSync,
-    setState,
-    shutdown,
-    startHttpServer,
-    waitForSync,
-} from "./http-server.js"
 import { log } from "./logger.js"
+import {
+    createDiagram,
+    createSession,
+    deleteDiagram,
+    deleteSession,
+    getDiagram,
+    getSession,
+    listDiagrams,
+    startCleanupInterval,
+    stopCleanupInterval,
+    updateDiagram,
+} from "./session-manager.js"
+import { svgRenderer } from "./svg-renderer.js"
 import { validateAndFixXml } from "./xml-validation.js"
+import fs from "node:fs/promises"
+import path from "node:path"
 
 // Server configuration
 const config = {
     port: parseInt(process.env.PORT || "6002", 10),
 }
 
-// Session state (single session for simplicity)
-let currentSession: {
-    id: string
-    xml: string
-    version: number
-    lastGetDiagramTime: number // Track when get_diagram was last called (for enforcing workflow)
-} | null = null
+// Export directory
+const EXPORTS_DIR = process.env.EXPORTS_DIR || "/tmp/mcp-drawio-exports"
 
 // Create MCP server
 const server = new McpServer({
     name: "next-ai-drawio",
-    version: "0.1.2",
+    version: "0.2.0",
 })
 
 // Register prompt with workflow guidance
@@ -77,28 +78,33 @@ server.prompt(
                     type: "text",
                     text: `# Draw.io Diagram Workflow Guidelines
 
-## Creating a New Diagram
-1. Call start_session to open the browser preview
-2. Use create_new_diagram with complete mxGraphModel XML to create a new diagram
+## Creating Diagrams
+1. Call start_session to create a new session (returns session_id)
+2. Use create_diagram with session_id to create diagrams (returns diagram_id)
+3. Each session can contain multiple diagrams
 
-## Adding Elements to Existing Diagram
-1. Use edit_diagram with "add" operation
-2. Provide a unique cell_id and complete mxCell XML
-3. No need to call get_diagram first - the server fetches latest state automatically
+## Editing Diagrams
+1. Use get_diagram to fetch current diagram XML
+2. Use edit_diagram with operations to modify specific cells
+3. Operations: add, update, delete
 
-## Modifying or Deleting Existing Elements
-1. FIRST call get_diagram to see current cell IDs and structure
-2. THEN call edit_diagram with "update" or "delete" operations
-3. For update, provide the cell_id and complete new mxCell XML
+## Exporting Diagrams
+1. Use export_diagram with format option:
+   - "svg": Standard SVG (for display only)
+   - "drawio_svg": SVG with embedded diagram data (editable)
+   - "drawio": Original XML format
+2. Choose output mode:
+   - "content": Returns SVG/XML string directly
+   - "url": Saves file and returns URL
 
 ## Important Notes
-- create_new_diagram REPLACES the entire diagram - only use for new diagrams
-- edit_diagram PRESERVES user's manual changes (fetches browser state first)
-- Always use unique cell_ids when adding elements (e.g., "shape-1", "arrow-2")`,
+- Always use unique cell_ids when adding elements
+- Keep elements within reasonable bounds (x=0-800, y=0-600)
+- Use unique IDs starting from "2" (0 and 1 are reserved)`,
                 },
             },
         ],
-    }),
+    })
 )
 
 // Tool: start_session
@@ -106,36 +112,22 @@ server.registerTool(
     "start_session",
     {
         description:
-            "Start a new diagram session and open the browser for real-time preview. " +
-            "Starts an embedded server and opens a browser window with draw.io. " +
-            "The browser will show diagram updates as they happen.",
+            "Start a new diagram session. " +
+            "Returns a session_id that can be used to create and manage multiple diagrams. " +
+            "Each session can contain multiple diagrams for a single report/document.",
         inputSchema: {},
     },
     async () => {
         try {
-            // Start embedded HTTP server
-            const port = await startHttpServer(config.port)
+            const session = createSession()
 
-            // Create session
-            const sessionId = `mcp-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 8)}`
-            currentSession = {
-                id: sessionId,
-                xml: "",
-                version: 0,
-                lastGetDiagramTime: 0,
-            }
-
-            // Open browser
-            const browserUrl = `http://localhost:${port}?mcp=${sessionId}`
-            await open(browserUrl)
-
-            log.info(`Started session ${sessionId}, browser at ${browserUrl}`)
+            log.info(`Session started: ${session.id}`)
 
             return {
                 content: [
                     {
                         type: "text",
-                        text: `Session started successfully!\n\nSession ID: ${sessionId}\nBrowser URL: ${browserUrl}\n\nThe browser will now show real-time diagram updates.`,
+                        text: `Session started successfully!\n\nSession ID: ${session.id}\n\nYou can now create diagrams using create_diagram with this session_id.`,
                     },
                 ],
             }
@@ -148,26 +140,16 @@ server.registerTool(
                 isError: true,
             }
         }
-    },
+    }
 )
 
-// Tool: create_new_diagram
+// Tool: create_diagram
 server.registerTool(
-    "create_new_diagram",
+    "create_diagram",
     {
-        description: `Create a NEW diagram from mxGraphModel XML. Use this when creating a diagram from scratch or replacing the current diagram entirely.
+        description: `Create a new diagram in a session from mxGraphModel XML.
 
-CRITICAL: You MUST provide the 'xml' argument in EVERY call. Do NOT call this tool without xml.
-
-When to use this tool:
-- Creating a new diagram from scratch
-- Replacing the current diagram with a completely different one
-- Major structural changes that require regenerating the diagram
-
-When to use edit_diagram instead:
-- Small modifications to existing diagram
-- Adding/removing individual elements
-- Changing labels, colors, or positions
+CRITICAL: You MUST provide 'session_id' and 'xml' arguments in EVERY call.
 
 XML FORMAT - Full mxGraphModel structure:
 <mxGraphModel>
@@ -182,38 +164,34 @@ XML FORMAT - Full mxGraphModel structure:
 
 LAYOUT CONSTRAINTS:
 - Keep all elements within x=0-800, y=0-600 (single page viewport)
-- Start from margins (x=40, y=40), keep elements grouped closely
 - Use unique IDs starting from "2" (0 and 1 are reserved)
 - Set parent="1" for top-level shapes
 - Space shapes 150-200px apart for clear edge routing
-
-EDGE ROUTING RULES:
-- Never let multiple edges share the same path - use different exitY/entryY values
-- For bidirectional connections (A↔B), use OPPOSITE sides
-- Always specify exitX, exitY, entryX, entryY explicitly in edge style
-- Route edges AROUND obstacles using waypoints (add 20-30px clearance)
-- Use natural connection points based on flow (not corners)
 
 COMMON STYLES:
 - Shapes: rounded=1; fillColor=#hex; strokeColor=#hex
 - Edges: endArrow=classic; edgeStyle=orthogonalEdgeStyle; curved=1
 - Text: fontSize=14; fontStyle=1 (bold); align=center`,
         inputSchema: {
+            session_id: z.string().describe("The session ID from start_session"),
+            diagram_id: z
+                .string()
+                .optional()
+                .describe("Optional custom diagram ID. Auto-generated if not provided."),
             xml: z
                 .string()
-                .describe(
-                    "REQUIRED: The complete mxGraphModel XML. Must always be provided.",
-                ),
+                .describe("REQUIRED: The complete mxGraphModel XML."),
         },
     },
-    async ({ xml: inputXml }) => {
+    async ({ session_id, diagram_id, xml: inputXml }) => {
         try {
-            if (!currentSession) {
+            const session = getSession(session_id)
+            if (!session) {
                 return {
                     content: [
                         {
                             type: "text",
-                            text: "Error: No active session. Please call start_session first.",
+                            text: `Error: Session not found: ${session_id}. Please call start_session first.`,
                         },
                     ],
                     isError: true,
@@ -240,54 +218,39 @@ COMMON STYLES:
                 }
             }
 
-            log.info(`Setting diagram content, ${xml.length} chars`)
-
-            // Sync from browser state first
-            const browserState = getState(currentSession.id)
-            if (browserState?.xml) {
-                currentSession.xml = browserState.xml
+            const diagram = createDiagram(session_id, xml, diagram_id)
+            if (!diagram) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Error: Failed to create diagram. ID may already exist.`,
+                        },
+                    ],
+                    isError: true,
+                }
             }
 
-            // Save user's state before AI overwrites (with cached SVG)
-            if (currentSession.xml) {
-                addHistory(
-                    currentSession.id,
-                    currentSession.xml,
-                    browserState?.svg || "",
-                )
-            }
-
-            // Update session state
-            currentSession.xml = xml
-            currentSession.version++
-            currentSession.lastGetDiagramTime = Date.now()
-
-            // Push to embedded server state
-            setState(currentSession.id, xml)
-
-            // Save AI result (no SVG yet - will be captured by browser)
-            addHistory(currentSession.id, xml, "")
-
-            log.info(`Diagram content set successfully`)
+            log.info(`Diagram created: ${diagram.id} in session ${session_id}`)
 
             return {
                 content: [
                     {
                         type: "text",
-                        text: `Diagram content set successfully!\n\nThe diagram is now visible in your browser.\n\nXML length: ${xml.length} characters`,
+                        text: `Diagram created successfully!\n\nSession ID: ${session_id}\nDiagram ID: ${diagram.id}\nXML length: ${xml.length} characters\n\nUse export_diagram to export as SVG.`,
                     },
                 ],
             }
         } catch (error) {
             const message =
                 error instanceof Error ? error.message : String(error)
-            log.error("create_new_diagram failed:", message)
+            log.error("create_diagram failed:", message)
             return {
                 content: [{ type: "text", text: `Error: ${message}` }],
                 isError: true,
             }
         }
-    },
+    }
 )
 
 // Tool: edit_diagram
@@ -295,125 +258,59 @@ server.registerTool(
     "edit_diagram",
     {
         description:
-            "Edit the current diagram by ID-based operations (update/add/delete cells).\n\n" +
-            "⚠️ REQUIRED: You MUST call get_diagram BEFORE this tool!\n" +
-            "This fetches the latest state from the browser including any manual user edits.\n" +
-            "Skipping get_diagram WILL cause user's changes to be LOST.\n\n" +
-            "Workflow:\n" +
-            "1. Call get_diagram to see current cell IDs and structure\n" +
-            "2. Use the returned XML to construct your edit operations\n" +
-            "3. Call edit_diagram with your operations\n\n" +
+            "Edit an existing diagram by ID-based operations (update/add/delete cells).\n\n" +
+            "⚠️ RECOMMENDED: Call get_diagram first to see current structure.\n\n" +
             "Operations:\n" +
             "- add: Add a new cell. Provide cell_id (new unique id) and new_xml.\n" +
             "- update: Replace an existing cell by its id. Provide cell_id and complete new_xml.\n" +
             "- delete: Remove a cell by its id. Only cell_id is needed.\n\n" +
-            "For add/update, new_xml must be a complete mxCell element including mxGeometry.\n\n" +
-            "Example - Add a rectangle:\n" +
-            '{"operations": [{"operation": "add", "cell_id": "rect-1", "new_xml": "<mxCell id=\\"rect-1\\" value=\\"Hello\\" style=\\"rounded=0;\\" vertex=\\"1\\" parent=\\"1\\"><mxGeometry x=\\"100\\" y=\\"100\\" width=\\"120\\" height=\\"60\\" as=\\"geometry\\"/></mxCell>"}]}\n\n' +
-            "Example - Update a cell:\n" +
-            '{"operations": [{"operation": "update", "cell_id": "3", "new_xml": "<mxCell id=\\"3\\" value=\\"New Label\\" style=\\"rounded=1;\\" vertex=\\"1\\" parent=\\"1\\"><mxGeometry x=\\"100\\" y=\\"100\\" width=\\"120\\" height=\\"60\\" as=\\"geometry\\"/></mxCell>"}]}\n\n' +
-            "Example - Delete a cell:\n" +
-            '{"operations": [{"operation": "delete", "cell_id": "rect-1"}]}',
+            "For add/update, new_xml must be a complete mxCell element including mxGeometry.",
         inputSchema: {
+            session_id: z.string().describe("The session ID"),
+            diagram_id: z.string().describe("The diagram ID to edit"),
             operations: z
                 .array(
                     z.object({
                         operation: z
                             .enum(["update", "add", "delete"])
-                            .describe(
-                                "Operation to perform: add, update, or delete",
-                            ),
+                            .describe("Operation to perform"),
                         cell_id: z.string().describe("The id of the mxCell"),
                         new_xml: z
                             .string()
                             .optional()
-                            .describe(
-                                "Complete mxCell XML element (required for update/add)",
-                            ),
-                    }),
+                            .describe("Complete mxCell XML (required for update/add)"),
+                    })
                 )
                 .describe("Array of operations to apply"),
         },
     },
-    async ({ operations }) => {
+    async ({ session_id, diagram_id, operations }) => {
         try {
-            if (!currentSession) {
+            const diagram = getDiagram(session_id, diagram_id)
+            if (!diagram) {
                 return {
                     content: [
                         {
                             type: "text",
-                            text: "Error: No active session. Please call start_session first.",
+                            text: `Error: Diagram not found: ${diagram_id} in session ${session_id}`,
                         },
                     ],
                     isError: true,
                 }
             }
 
-            // Enforce workflow: require get_diagram to be called first
-            const timeSinceGet = Date.now() - currentSession.lastGetDiagramTime
-            if (timeSinceGet > 30000) {
-                // 30 seconds
-                log.warn(
-                    "edit_diagram called without recent get_diagram - rejecting to prevent data loss",
-                )
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text:
-                                "Error: You must call get_diagram first before edit_diagram.\n\n" +
-                                "This ensures you have the latest diagram state including any manual edits the user made in the browser. " +
-                                "Please call get_diagram, then use that XML to construct your edit operations.",
-                        },
-                    ],
-                    isError: true,
-                }
-            }
-
-            // Fetch latest state from browser
-            const browserState = getState(currentSession.id)
-            if (browserState?.xml) {
-                currentSession.xml = browserState.xml
-                log.info("Fetched latest diagram state from browser")
-            }
-
-            if (!currentSession.xml) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: "Error: No diagram to edit. Please create a diagram first with create_new_diagram.",
-                        },
-                    ],
-                    isError: true,
-                }
-            }
-
-            log.info(`Editing diagram with ${operations.length} operation(s)`)
-
-            // Save before editing (with cached SVG from browser)
-            addHistory(
-                currentSession.id,
-                currentSession.xml,
-                browserState?.svg || "",
-            )
+            log.info(`Editing diagram ${diagram_id} with ${operations.length} operation(s)`)
 
             // Validate and auto-fix new_xml for each operation
             const validatedOps = operations.map((op) => {
                 if (op.new_xml) {
-                    const { valid, error, fixed, fixes } = validateAndFixXml(
-                        op.new_xml,
-                    )
+                    const { valid, error, fixed, fixes } = validateAndFixXml(op.new_xml)
                     if (fixed) {
-                        log.info(
-                            `Operation ${op.operation} ${op.cell_id}: XML auto-fixed: ${fixes.join(", ")}`,
-                        )
+                        log.info(`Operation ${op.operation} ${op.cell_id}: XML auto-fixed: ${fixes.join(", ")}`)
                         return { ...op, new_xml: fixed }
                     }
                     if (!valid && error) {
-                        log.warn(
-                            `Operation ${op.operation} ${op.cell_id}: XML validation failed: ${error}`,
-                        )
+                        log.warn(`Operation ${op.operation} ${op.cell_id}: XML validation failed: ${error}`)
                     }
                 }
                 return op
@@ -421,8 +318,8 @@ server.registerTool(
 
             // Apply operations
             const { result, errors } = applyDiagramOperations(
-                currentSession.xml,
-                validatedOps as DiagramOperation[],
+                diagram.xml,
+                validatedOps as DiagramOperation[]
             )
 
             if (errors.length > 0) {
@@ -432,17 +329,10 @@ server.registerTool(
                 log.warn(`Edit had ${errors.length} error(s): ${errorMessages}`)
             }
 
-            // Update state
-            currentSession.xml = result
-            currentSession.version++
+            // Update diagram
+            updateDiagram(session_id, diagram_id, result)
 
-            // Push to embedded server
-            setState(currentSession.id, result)
-
-            // Save AI result (no SVG yet - will be captured by browser)
-            addHistory(currentSession.id, result, "")
-
-            log.info(`Diagram edited successfully`)
+            log.info(`Diagram edited successfully: ${diagram_id}`)
 
             const successMsg = `Diagram edited successfully!\n\nApplied ${operations.length} operation(s).`
             const errorMsg =
@@ -467,7 +357,7 @@ server.registerTool(
                 isError: true,
             }
         }
-    },
+    }
 )
 
 // Tool: get_diagram
@@ -475,50 +365,25 @@ server.registerTool(
     "get_diagram",
     {
         description:
-            "Get the current diagram XML (fetches latest from browser, including user's manual edits). " +
-            "Call this BEFORE edit_diagram if you need to update or delete existing elements, " +
-            "so you can see the current cell IDs and structure.",
+            "Get the current diagram XML. " +
+            "Call this before edit_diagram to see current cell IDs and structure.",
+        inputSchema: {
+            session_id: z.string().describe("The session ID"),
+            diagram_id: z.string().describe("The diagram ID to get"),
+        },
     },
-    async () => {
+    async ({ session_id, diagram_id }) => {
         try {
-            if (!currentSession) {
+            const diagram = getDiagram(session_id, diagram_id)
+            if (!diagram) {
                 return {
                     content: [
                         {
                             type: "text",
-                            text: "Error: No active session. Please call start_session first.",
+                            text: `Error: Diagram not found: ${diagram_id} in session ${session_id}`,
                         },
                     ],
                     isError: true,
-                }
-            }
-
-            // Request browser to push fresh state and wait for it
-            const syncRequested = requestSync(currentSession.id)
-            if (syncRequested) {
-                const synced = await waitForSync(currentSession.id)
-                if (!synced) {
-                    log.warn("get_diagram: sync timeout - state may be stale")
-                }
-            }
-
-            // Mark that get_diagram was called (for edit_diagram workflow check)
-            currentSession.lastGetDiagramTime = Date.now()
-
-            // Fetch latest state from browser
-            const browserState = getState(currentSession.id)
-            if (browserState?.xml) {
-                currentSession.xml = browserState.xml
-            }
-
-            if (!currentSession.xml) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: "No diagram exists yet. Use create_new_diagram to create one.",
-                        },
-                    ],
                 }
             }
 
@@ -526,7 +391,7 @@ server.registerTool(
                 content: [
                     {
                         type: "text",
-                        text: `Current diagram XML:\n\n${currentSession.xml}`,
+                        text: `Current diagram XML:\n\n${diagram.xml}`,
                     },
                 ],
             }
@@ -539,74 +404,145 @@ server.registerTool(
                 isError: true,
             }
         }
+    }
+)
+
+// Tool: list_diagrams
+server.registerTool(
+    "list_diagrams",
+    {
+        description: "List all diagrams in a session.",
+        inputSchema: {
+            session_id: z.string().describe("The session ID"),
+        },
     },
+    async ({ session_id }) => {
+        try {
+            const diagrams = listDiagrams(session_id)
+            if (!diagrams) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Error: Session not found: ${session_id}`,
+                        },
+                    ],
+                    isError: true,
+                }
+            }
+
+            if (diagrams.length === 0) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `No diagrams in session ${session_id}.\n\nUse create_diagram to create one.`,
+                        },
+                    ],
+                }
+            }
+
+            const list = diagrams
+                .map((d) => `- ${d.id} (created: ${d.createdAt.toISOString()})`)
+                .join("\n")
+
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Diagrams in session ${session_id}:\n\n${list}`,
+                    },
+                ],
+            }
+        } catch (error) {
+            const message =
+                error instanceof Error ? error.message : String(error)
+            log.error("list_diagrams failed:", message)
+            return {
+                content: [{ type: "text", text: `Error: ${message}` }],
+                isError: true,
+            }
+        }
+    }
 )
 
 // Tool: export_diagram
 server.registerTool(
     "export_diagram",
     {
-        description: "Export the current diagram to a .drawio file.",
+        description: `Export a diagram to SVG or other formats.
+
+Formats:
+- "svg": Standard SVG for display (cannot be re-edited in draw.io)
+- "drawio_svg": SVG with embedded diagram data (can be opened and edited in draw.io)
+- "drawio": Original XML format
+
+Output modes:
+- "content": Returns the file content directly (good for small files)
+- "url": Saves to server and returns URL (good for embedding in markdown)`,
         inputSchema: {
-            path: z
-                .string()
-                .describe(
-                    "File path to save the diagram (e.g., ./diagram.drawio)",
-                ),
+            session_id: z.string().describe("The session ID"),
+            diagram_id: z.string().describe("The diagram ID to export"),
+            format: z
+                .enum(["svg", "drawio_svg", "drawio"])
+                .default("svg")
+                .describe("Export format"),
+            output: z
+                .enum(["content", "url"])
+                .default("content")
+                .describe("Output mode: content string or URL"),
         },
     },
-    async ({ path }) => {
+    async ({ session_id, diagram_id, format, output }) => {
         try {
-            if (!currentSession) {
+            const diagram = getDiagram(session_id, diagram_id)
+            if (!diagram) {
                 return {
                     content: [
                         {
                             type: "text",
-                            text: "Error: No active session. Please call start_session first.",
+                            text: `Error: Diagram not found: ${diagram_id} in session ${session_id}`,
                         },
                     ],
                     isError: true,
                 }
             }
 
-            // Fetch latest state
-            const browserState = getState(currentSession.id)
-            if (browserState?.xml) {
-                currentSession.xml = browserState.xml
+            let content: string
+
+            if (format === "drawio") {
+                // Just return the XML as-is
+                content = diagram.xml
+            } else {
+                // Render to SVG using Puppeteer
+                log.info(`Rendering SVG for diagram ${diagram_id}...`)
+                content = await svgRenderer.render(diagram.xml, {
+                    format: format === "drawio_svg" ? "drawio_svg" : "svg",
+                })
+                log.info(`SVG rendered: ${content.length} characters`)
             }
 
-            if (!currentSession.xml) {
+            if (output === "url") {
+                // Save to file and return URL
+                const url = await saveExportFile(session_id, diagram_id, format, content)
                 return {
                     content: [
                         {
                             type: "text",
-                            text: "Error: No diagram to export. Please create a diagram first.",
+                            text: `Diagram exported successfully!\n\nFormat: ${format}\nURL: ${url}\n\nYou can embed this in markdown: ![Diagram](${url})`,
                         },
                     ],
-                    isError: true,
                 }
-            }
-
-            const fs = await import("node:fs/promises")
-            const nodePath = await import("node:path")
-
-            let filePath = path
-            if (!filePath.endsWith(".drawio")) {
-                filePath = `${filePath}.drawio`
-            }
-
-            const absolutePath = nodePath.resolve(filePath)
-            await fs.writeFile(absolutePath, currentSession.xml, "utf-8")
-
-            log.info(`Diagram exported to ${absolutePath}`)
-
-            return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Diagram exported successfully!\n\nFile: ${absolutePath}\nSize: ${currentSession.xml.length} characters`,
-                    },
-                ],
+            } else {
+                // Return content directly
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Diagram exported successfully!\n\nFormat: ${format}\nLength: ${content.length} characters\n\n${content}`,
+                        },
+                    ],
+                }
             }
         } catch (error) {
             const message =
@@ -617,42 +553,308 @@ server.registerTool(
                 isError: true,
             }
         }
-    },
+    }
 )
+
+// Tool: delete_diagram
+server.registerTool(
+    "delete_diagram",
+    {
+        description: "Delete a diagram from a session.",
+        inputSchema: {
+            session_id: z.string().describe("The session ID"),
+            diagram_id: z.string().describe("The diagram ID to delete"),
+        },
+    },
+    async ({ session_id, diagram_id }) => {
+        try {
+            const deleted = deleteDiagram(session_id, diagram_id)
+            if (!deleted) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Error: Diagram not found: ${diagram_id} in session ${session_id}`,
+                        },
+                    ],
+                    isError: true,
+                }
+            }
+
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Diagram deleted: ${diagram_id}`,
+                    },
+                ],
+            }
+        } catch (error) {
+            const message =
+                error instanceof Error ? error.message : String(error)
+            log.error("delete_diagram failed:", message)
+            return {
+                content: [{ type: "text", text: `Error: ${message}` }],
+                isError: true,
+            }
+        }
+    }
+)
+
+// Tool: end_session
+server.registerTool(
+    "end_session",
+    {
+        description: "End a session and clean up all associated diagrams and exports.",
+        inputSchema: {
+            session_id: z.string().describe("The session ID to end"),
+        },
+    },
+    async ({ session_id }) => {
+        try {
+            const deleted = deleteSession(session_id)
+            if (!deleted) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Error: Session not found: ${session_id}`,
+                        },
+                    ],
+                    isError: true,
+                }
+            }
+
+            // Clean up export files on disk
+            try {
+                const sessionDir = path.join(EXPORTS_DIR, session_id)
+                await fs.rm(sessionDir, { recursive: true, force: true })
+                log.info(`Export files cleaned up: ${sessionDir}`)
+            } catch (error) {
+                const err = error as NodeJS.ErrnoException
+                // Ignore if directory doesn't exist
+                if (err.code !== "ENOENT") {
+                    log.error(`Failed to clean up exports for ${session_id}:`, error)
+                }
+            }
+
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Session ended: ${session_id}\n\nAll diagrams and exports have been cleaned up.`,
+                    },
+                ],
+            }
+        } catch (error) {
+            const message =
+                error instanceof Error ? error.message : String(error)
+            log.error("end_session failed:", message)
+            return {
+                content: [{ type: "text", text: `Error: ${message}` }],
+                isError: true,
+            }
+        }
+    }
+)
+
+// Helper function to save export files
+async function saveExportFile(
+    sessionId: string,
+    diagramId: string,
+    format: string,
+    content: string
+): Promise<string> {
+    const sessionDir = path.join(EXPORTS_DIR, sessionId)
+    await fs.mkdir(sessionDir, { recursive: true })
+
+    let filename: string
+    if (format === "drawio_svg") {
+        filename = `${diagramId}.drawio.svg`
+    } else if (format === "svg") {
+        filename = `${diagramId}.svg`
+    } else {
+        filename = `${diagramId}.drawio`
+    }
+
+    const filePath = path.join(sessionDir, filename)
+    await fs.writeFile(filePath, content, "utf-8")
+    log.info(`Export saved: ${filePath}`)
+
+    return `http://localhost:${config.port}/exports/${sessionId}/${filename}`
+}
+
+// HTTP server instance
+let httpServer: http.Server | null = null
 
 // Graceful shutdown handler
 let isShuttingDown = false
-function gracefulShutdown(reason: string) {
+async function gracefulShutdown(reason: string) {
     if (isShuttingDown) return
     isShuttingDown = true
     log.info(`Shutting down: ${reason}`)
-    shutdown()
+
+    // Shutdown components
+    stopCleanupInterval()
+    await svgRenderer.shutdown()
+    if (httpServer) {
+        httpServer.close()
+    }
+
     process.exit(0)
 }
 
-// Handle stdin close (primary method - works on all platforms including Windows)
-process.stdin.on("close", () => gracefulShutdown("stdin closed"))
-process.stdin.on("end", () => gracefulShutdown("stdin ended"))
-
-// Handle signals (may not work reliably on Windows)
+// Handle signals
 process.on("SIGINT", () => gracefulShutdown("SIGINT"))
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"))
 
-// Handle broken pipe (writing to closed stdout)
-process.stdout.on("error", (err) => {
-    if (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED") {
-        gracefulShutdown("stdout error")
-    }
+// Handle uncaught errors
+process.on("uncaughtException", (error) => {
+    log.error("Uncaught exception:", error)
+    gracefulShutdown("uncaughtException")
+})
+
+process.on("unhandledRejection", (reason) => {
+    log.error("Unhandled rejection:", reason)
 })
 
 // Start the MCP server
 async function main() {
-    log.info("Starting MCP server for Next AI Draw.io (embedded mode)...")
+    log.info("Starting MCP Streamable HTTP server for Next AI Draw.io...")
 
-    const transport = new StdioServerTransport()
+    // Initialize SVG renderer (Puppeteer)
+    log.info("Initializing Puppeteer browser...")
+    await svgRenderer.init()
+
+    // Start session cleanup interval
+    startCleanupInterval()
+
+    // Create transport with session ID generator for stateful mode
+    const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => `mcp-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 8)}`,
+    })
+
+    // Connect MCP server to transport
     await server.connect(transport)
 
-    log.info("MCP server running on stdio")
+    // Create HTTP server
+    httpServer = http.createServer(async (req, res) => {
+        const url = new URL(req.url || "/", `http://localhost:${config.port}`)
+
+        // CORS headers
+        res.setHeader("Access-Control-Allow-Origin", "*")
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type, mcp-session-id")
+        res.setHeader("Access-Control-Expose-Headers", "mcp-session-id")
+
+        if (req.method === "OPTIONS") {
+            res.writeHead(204)
+            res.end()
+            return
+        }
+
+        // MCP endpoint - handles both GET (SSE) and POST (messages)
+        if (url.pathname === "/mcp") {
+            await transport.handleRequest(req, res)
+            return
+        }
+
+        // Static file serving for exports
+        if (url.pathname.startsWith("/exports/")) {
+            await handleExports(req, res, url)
+            return
+        }
+
+        // Health check
+        if (url.pathname === "/health") {
+            res.writeHead(200, { "Content-Type": "application/json" })
+            res.end(JSON.stringify({
+                status: "ok",
+                uptime: process.uptime(),
+            }))
+            return
+        }
+
+        // Status page
+        if (url.pathname === "/") {
+            res.writeHead(200, { "Content-Type": "application/json" })
+            res.end(JSON.stringify({
+                name: "next-ai-drawio-mcp",
+                version: "0.2.0",
+                transport: "streamable-http",
+                endpoints: {
+                    mcp: "/mcp",
+                    exports: "/exports/{session_id}/{diagram_id}.{format}",
+                    health: "/health",
+                },
+            }))
+            return
+        }
+
+        res.writeHead(404)
+        res.end("Not Found")
+    })
+
+    // Start listening
+    httpServer.listen(config.port, () => {
+        log.info(`MCP server running on http://localhost:${config.port}`)
+        log.info("Endpoints:")
+        log.info(`  MCP:      http://localhost:${config.port}/mcp`)
+        log.info(`  Exports:  http://localhost:${config.port}/exports/`)
+        log.info(`  Health:   http://localhost:${config.port}/health`)
+    })
+}
+
+// Handle export file serving
+async function handleExports(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    url: URL
+): Promise<void> {
+    if (req.method !== "GET") {
+        res.writeHead(405)
+        res.end("Method Not Allowed")
+        return
+    }
+
+    const pathParts = url.pathname.split("/").filter(Boolean)
+    if (pathParts.length < 3) {
+        res.writeHead(400)
+        res.end("Invalid export path")
+        return
+    }
+
+    const sessionId = pathParts[1]
+    const filename = pathParts.slice(2).join("/")
+
+    if (sessionId.includes("..") || filename.includes("..")) {
+        res.writeHead(400)
+        res.end("Invalid path")
+        return
+    }
+
+    const filePath = path.join(EXPORTS_DIR, sessionId, filename)
+
+    try {
+        const content = await fs.readFile(filePath)
+        let contentType = "application/octet-stream"
+        if (filename.endsWith(".svg")) {
+            contentType = "image/svg+xml"
+        } else if (filename.endsWith(".drawio")) {
+            contentType = "application/xml"
+        }
+        res.writeHead(200, { "Content-Type": contentType })
+        res.end(content)
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            res.writeHead(404)
+            res.end("File not found")
+        } else {
+            log.error("Export file read error:", error)
+            res.writeHead(500)
+            res.end("Internal server error")
+        }
+    }
 }
 
 main().catch((error) => {

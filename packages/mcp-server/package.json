@@ -1,7 +1,7 @@
 {
     "name": "@next-ai-drawio/mcp-server",
-    "version": "0.1.13",
-    "description": "MCP server for Next AI Draw.io - AI-powered diagram generation with real-time browser preview",
+    "version": "0.2.0",
+    "description": "MCP SSE server for Next AI Draw.io - AI-powered diagram generation with SVG export",
     "type": "module",
     "main": "dist/index.js",
     "bin": {
@@ -19,7 +19,9 @@
         "diagram",
         "ai",
         "claude",
-        "model-context-protocol"
+        "model-context-protocol",
+        "sse",
+        "svg"
     ],
     "author": "DayuanJiang",
     "license": "Apache-2.0",
@@ -38,11 +40,11 @@
     "dependencies": {
         "@modelcontextprotocol/sdk": "^1.0.4",
         "linkedom": "^0.18.0",
-        "open": "^11.0.0",
+        "puppeteer": "^24.35.0",
         "zod": "^4.0.0"
     },
     "devDependencies": {
-        "@types/node": "^24.0.0",
+        "@types/node": "^24.10.9",
         "tsx": "^4.19.0",
         "typescript": "^5"
     },
