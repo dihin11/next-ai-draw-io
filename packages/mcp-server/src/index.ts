@@ -45,6 +45,7 @@ import {
 } from "./http-server.js"
 import { log } from "./logger.js"
 import { validateAndFixXml } from "./xml-validation.js"
+import { xmlToSvg } from "./xml-to-svg.js"
 
 // Server configuration
 const config = {
@@ -625,80 +626,115 @@ server.registerTool(
     "export_svg",
     {
         description:
-            "Export the current diagram to an SVG file.\n\n" +
-            "The SVG is obtained from the browser's cached preview. " +
-            "If the cache is not available or you need the latest version, " +
-            "ensure the browser has saved the diagram recently.",
+            "Convert a draw.io file to SVG.\n\n" +
+            "Converts any .drawio file on disk to SVG format.\n\n" +
+            "The SVG can be opened as an image or edited in draw.io if editable mode is enabled.\n\n" +
+            "Supports two rendering modes:\n" +
+            "- Simplified (default): Built-in converter, no external dependencies\n" +
+            "- High-fidelity: Uses official draw.io CLI for 100% accurate rendering (requires draw.io desktop)",
         inputSchema: {
             path: z
                 .string()
-                .describe("File path to save the SVG (e.g., ./diagram.svg)"),
+                .describe("Output file path (e.g., ./output.svg or ./output.drawio.svg)"),
+            input_path: z
+                .string()
+                .describe("Input .drawio file path to convert"),
+            editable: z
+                .boolean()
+                .optional()
+                .describe(
+                    "If true, embed draw.io XML data in SVG so it can be opened and edited in draw.io. " +
+                    "The file should be saved as .drawio.svg for best compatibility. Default: false",
+                ),
+            high_fidelity: z
+                .boolean()
+                .optional()
+                .describe(
+                    "If true, use official draw.io CLI for 100% accurate rendering. " +
+                    "Requires draw.io desktop to be installed. " +
+                    "Falls back to simplified mode if CLI is not available. Default: false",
+                ),
         },
     },
-    async ({ path }) => {
+    async ({ path, input_path, editable, high_fidelity }) => {
         try {
-            if (!currentSession) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text: "Error: No active session. Please call start_session first.",
-                        },
-                    ],
-                    isError: true,
-                }
-            }
-
-            // Fetch latest state from browser
-            const browserState = getState(currentSession.id)
-            if (browserState?.xml) {
-                currentSession.xml = browserState.xml
-            }
-
-            // Check if SVG is available in cache
-            const svgData = browserState?.svg
-            if (!svgData) {
-                return {
-                    content: [
-                        {
-                            type: "text",
-                            text:
-                                "Error: No SVG cached. Please ensure:\n" +
-                                "1. The browser window is open and connected\n" +
-                                "2. You have made changes in the browser (triggers SVG generation)\n" +
-                                "3. Wait a moment for the browser to save the SVG",
-                        },
-                    ],
-                    isError: true,
-                }
-            }
-
             const fs = await import("node:fs/promises")
             const nodePath = await import("node:path")
+            const { exportDrawioToSvg, isDrawioCliAvailable } = await import("./xml-to-svg.js")
 
+            const inputAbsolutePath = nodePath.resolve(input_path)
+            log.info(`Reading draw.io file: ${inputAbsolutePath}`)
+
+            // Check if input file exists
+            try {
+                await fs.access(inputAbsolutePath)
+            } catch (err) {
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: `Error: File not found: ${inputAbsolutePath}`,
+                        },
+                    ],
+                    isError: true,
+                }
+            }
+
+            // Prepare output path
             let filePath = path
+            // Auto-detect editable mode from filename
+            const isDrawioSvg = filePath.endsWith(".drawio.svg")
+            if (isDrawioSvg && editable === undefined) {
+                editable = true
+            }
             if (!filePath.endsWith(".svg")) {
-                filePath = `${filePath}.svg`
+                filePath = editable ? `${filePath}.drawio.svg` : `${filePath}.svg`
             }
 
             const absolutePath = nodePath.resolve(filePath)
 
-            // Handle data URI format (data:image/svg+xml;base64,...)
-            let svgContent = svgData
-            if (svgData.startsWith("data:image/svg+xml")) {
-                const base64Data = svgData.split(",")[1]
-                svgContent = Buffer.from(base64Data, "base64").toString("utf-8")
+            // Determine rendering method
+            let renderMethod = "simplified"
+            let cliInfo = ""
+
+            if (high_fidelity) {
+                const cliStatus = await isDrawioCliAvailable()
+                if (cliStatus.available) {
+                    renderMethod = "cli"
+                    cliInfo = `\nCLI version: ${cliStatus.version}`
+                    if (process.platform === "linux" && !process.env.DISPLAY) {
+                        cliInfo += cliStatus.xvfbAvailable 
+                            ? "\nUsing xvfb for headless rendering"
+                            : "\nWarning: xvfb not available, headless rendering may fail"
+                    }
+                } else {
+                    cliInfo = "\nNote: draw.io CLI not found, using simplified renderer"
+                }
             }
 
-            await fs.writeFile(absolutePath, svgContent, "utf-8")
+            // Convert XML to SVG
+            log.info(`Converting to SVG (mode: ${renderMethod})...`)
+            
+            const result = await exportDrawioToSvg(inputAbsolutePath, absolutePath, {
+                embedXml: editable,
+                preferCli: high_fidelity === true,
+            })
 
-            log.info(`Diagram exported to SVG: ${absolutePath}`)
+            const statInfo = await fs.stat(absolutePath)
+            const editableInfo = editable
+                ? "\nEditable: Yes (can be opened and edited in draw.io)"
+                : ""
+            const methodInfo = result.method === "cli" 
+                ? "\nRenderer: draw.io CLI (high-fidelity)"
+                : "\nRenderer: Simplified (built-in)"
+
+            log.info(`SVG exported to: ${absolutePath}`)
 
             return {
                 content: [
                     {
                         type: "text",
-                        text: `Diagram exported successfully!\n\nFile: ${absolutePath}\nSize: ${svgContent.length} bytes`,
+                        text: `SVG exported successfully!\n\nSource: ${inputAbsolutePath}\nOutput: ${absolutePath}\nSize: ${statInfo.size} bytes${methodInfo}${editableInfo}${cliInfo}`,
                     },
                 ],
             }
@@ -708,6 +744,75 @@ server.registerTool(
             log.error("export_svg failed:", message)
             return {
                 content: [{ type: "text", text: `Error: ${message}` }],
+                isError: true,
+            }
+        }
+    },
+)
+
+// Tool: check_drawio_cli
+server.registerTool(
+    "check_drawio_cli",
+    {
+        description:
+            "Check if draw.io desktop CLI is available for high-fidelity SVG export.\n\n" +
+            "Returns information about:\n" +
+            "- Whether draw.io CLI is installed\n" +
+            "- CLI version and path\n" +
+            "- Whether xvfb is available for headless server operation\n" +
+            "- Installation instructions if not available",
+        inputSchema: {},
+    },
+    async () => {
+        try {
+            const { isDrawioCliAvailable } = await import("./xml-to-svg.js")
+            const status = await isDrawioCliAvailable()
+
+            if (status.available) {
+                let message = `draw.io CLI is available!\n\n`
+                message += `Path: ${status.path}\n`
+                message += `Version: ${status.version}\n`
+                
+                if (process.platform === "linux") {
+                    message += `\nHeadless support (xvfb): ${status.xvfbAvailable ? "Yes" : "No"}`
+                    if (!status.xvfbAvailable && !process.env.DISPLAY) {
+                        message += `\n\nWarning: Running on headless Linux without xvfb.`
+                        message += `\nInstall xvfb for headless operation: sudo apt-get install xvfb`
+                    }
+                }
+                
+                message += `\n\nYou can use high_fidelity=true in export_svg for 100% accurate rendering.`
+                
+                return {
+                    content: [{ type: "text", text: message }],
+                }
+            } else {
+                let message = `draw.io CLI is NOT available.\n\n`
+                message += `The simplified built-in renderer will be used for SVG export.\n\n`
+                message += `To enable high-fidelity export, install draw.io desktop:\n\n`
+                
+                if (process.platform === "linux") {
+                    message += `Linux:\n`
+                    message += `  1. Download AppImage from https://github.com/jgraph/drawio-desktop/releases\n`
+                    message += `  2. chmod +x drawio-x86_64-*.AppImage\n`
+                    message += `  3. sudo mv drawio-x86_64-*.AppImage /usr/local/bin/drawio\n`
+                    message += `  4. For headless server: sudo apt-get install xvfb\n`
+                } else if (process.platform === "darwin") {
+                    message += `macOS:\n`
+                    message += `  brew install --cask drawio\n`
+                } else if (process.platform === "win32") {
+                    message += `Windows:\n`
+                    message += `  Download installer from https://github.com/jgraph/drawio-desktop/releases\n`
+                }
+                
+                return {
+                    content: [{ type: "text", text: message }],
+                }
+            }
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            return {
+                content: [{ type: "text", text: `Error checking CLI status: ${message}` }],
                 isError: true,
             }
         }
